@@ -59,7 +59,7 @@ The mic watcher uses macOS `audiodevice:inUse()` to detect actual hardware micro
 
 2. Clone this repo:
    ```bash
-   git clone https://github.com/jakerandall/wispr-media-controller.git
+   git clone https://github.com/JakeRoyRandall/wispr-media-controller.git
    ```
 
 3. Copy or symlink `init.lua` to your Hammerspoon config:

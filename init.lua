@@ -5,7 +5,7 @@
 
 	Rule: When the mic is active, audio must be off.
 
-	https://github.com/jakerandall/wispr-media-controller
+	https://github.com/JakeRoyRandall/wispr-media-controller
 ]]
 
 require("hs.ipc")
