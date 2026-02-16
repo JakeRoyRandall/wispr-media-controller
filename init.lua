@@ -1,10 +1,7 @@
 --[[
-	Wispr Media Controller for Hammerspoon
-	Automatically pauses Spotify and Chrome/YouTube when your microphone activates.
-	Resumes playback when the mic goes inactive.
-
-	Rule: When the mic is active, audio must be off.
-
+	Wispr Media Controller
+	Rule: When microphone is active, audio must be off.
+	Uses mic hardware state polling — no toggle, no guessing.
 	https://github.com/JakeRoyRandall/wispr-media-controller
 ]]
 
@@ -14,42 +11,24 @@ local function log(msg)
 	print("[WISPR] " .. msg)
 end
 
--- ============================================================================
--- CONFIGURATION
--- ============================================================================
-
--- Hotkey that triggers your dictation tool (e.g., Wispr Flow, macOS Dictation)
--- Change these to match your setup
-local TRIGGER_MODIFIERS = {"ctrl", "shift"}
-
--- Polling interval (seconds) for mic watcher
-local POLL_INTERVAL = 0.5
-
--- Debounce interval (seconds) to prevent double-triggers
-local DEBOUNCE_INTERVAL = 0.3
-
--- ============================================================================
--- STATE
--- ============================================================================
-
+-- State: what WE changed
 local spotifyPausedByUs = false
-local chromePausedTab = nil
+local systemMutedByUs = false
+
+-- Polling timer
 local micWatcher = nil
 
 -- ============================================================================
--- MIC STATE DETECTION
+-- MIC STATE (macOS audiodevice hardware query)
 -- ============================================================================
-
 local function micIsActive()
 	local dev = hs.audiodevice.defaultInputDevice()
-	if dev then return dev:inUse() end
-	return false
+	return dev and dev:inUse() or false
 end
 
 -- ============================================================================
--- SPOTIFY CONTROL
+-- SPOTIFY CONTROL (AppleScript — Spotify has its own scripting bridge)
 -- ============================================================================
-
 local function spotifyIsPlaying()
 	local ok, result = hs.osascript.applescript([[
 		tell application "System Events"
@@ -77,172 +56,115 @@ local function spotifyPlay()
 end
 
 -- ============================================================================
--- CHROME VIDEO CONTROL
--- Scans all Chrome windows/tabs for a playing <video> element.
--- Requires: Chrome > View > Developer > Allow JavaScript from Apple Events
+-- SYSTEM MUTE (for Chrome/YouTube — avoids media key toggle problem)
+-- Muting silences audio without changing play/pause state.
+-- This means we never accidentally START a paused video.
 -- ============================================================================
-
-local function findPlayingChromeVideo()
-	local ok, result = hs.osascript.applescript([[
-		tell application "System Events"
-			if not (exists process "Google Chrome") then return "no_chrome"
-		end tell
-		tell application "Google Chrome"
-			set winIndex to 0
-			repeat with w in windows
-				set winIndex to winIndex + 1
-				set tabIndex to 0
-				repeat with t in tabs of w
-					set tabIndex to tabIndex + 1
-					try
-						set isPlaying to execute t javascript "
-							var v = document.querySelector('video');
-							(v && !v.paused) ? 'playing' : 'not_playing';
-						"
-						if isPlaying is "playing" then
-							return (winIndex as string) & "," & (tabIndex as string)
-						end if
-					end try
-				end repeat
-			end repeat
-			return "none"
-		end tell
-	]])
-	if ok and result and result ~= "none" and result ~= "no_chrome" then
-		return result
+local function muteSystem()
+	local dev = hs.audiodevice.defaultOutputDevice()
+	if not dev then return end
+	-- Only mute if not already muted (respect user's mute state)
+	if not dev:muted() then
+		dev:setMuted(true)
+		systemMutedByUs = true
+		log("SYSTEM: Muted output (" .. dev:name() .. ")")
+	else
+		log("SYSTEM: Already muted, skipping")
 	end
-	return nil
 end
 
-local function pauseChromeTab(tabRef)
-	local parts = {}
-	for part in string.gmatch(tabRef, "[^,]+") do
-		table.insert(parts, tonumber(part))
+local function unmuteSystem()
+	if not systemMutedByUs then return end
+	local dev = hs.audiodevice.defaultOutputDevice()
+	if dev then
+		dev:setMuted(false)
+		log("SYSTEM: Unmuted output (" .. dev:name() .. ")")
 	end
-	log("CHROME: Pausing win=" .. parts[1] .. " tab=" .. parts[2])
-	hs.osascript.applescript(string.format([[
-		tell application "Google Chrome"
-			try
-				execute tab %d of window %d javascript "document.querySelector('video').pause();"
-			end try
-		end tell
-	]], parts[2], parts[1]))
-end
-
-local function resumeChromeTab(tabRef)
-	local parts = {}
-	for part in string.gmatch(tabRef, "[^,]+") do
-		table.insert(parts, tonumber(part))
-	end
-	log("CHROME: Resuming win=" .. parts[1] .. " tab=" .. parts[2])
-	hs.osascript.applescript(string.format([[
-		tell application "Google Chrome"
-			try
-				execute tab %d of window %d javascript "
-					var v = document.querySelector('video');
-					if (v && v.paused) v.play();
-				"
-			end try
-		end tell
-	]], parts[2], parts[1]))
+	systemMutedByUs = false
 end
 
 -- ============================================================================
--- PAUSE / RESUME ORCHESTRATION
+-- PAUSE ALL MEDIA
 -- ============================================================================
-
 local function pauseAllMedia()
-	local pausedAnything = false
+	local didAnything = false
 
+	-- Spotify: proper pause via API (stops playback, saves position)
 	if spotifyIsPlaying() then
 		spotifyPause()
 		spotifyPausedByUs = true
-		pausedAnything = true
+		didAnything = true
 	end
 
-	local tab = findPlayingChromeVideo()
-	if tab then
-		pauseChromeTab(tab)
-		chromePausedTab = tab
-		pausedAnything = true
-	end
+	-- Everything else (Chrome/YouTube/etc): mute system output
+	-- This silences audio without toggling play/pause state
+	muteSystem()
+	if systemMutedByUs then didAnything = true end
 
-	if pausedAnything then
+	if didAnything then
 		hs.alert.show("\u{23F8}\u{FE0F}", 0.3)
 	end
 
-	return pausedAnything
+	return didAnything
 end
 
+-- ============================================================================
+-- RESUME MEDIA WE CHANGED
+-- ============================================================================
 local function resumeOurMedia()
-	local resumedAnything = false
+	local didAnything = false
 
 	if spotifyPausedByUs then
 		spotifyPlay()
 		spotifyPausedByUs = false
-		resumedAnything = true
+		didAnything = true
 	end
 
-	if chromePausedTab then
-		resumeChromeTab(chromePausedTab)
-		chromePausedTab = nil
-		resumedAnything = true
+	if systemMutedByUs then
+		unmuteSystem()
+		didAnything = true
 	end
 
-	if resumedAnything then
+	if didAnything then
 		hs.alert.show("\u{25B6}\u{FE0F}", 0.3)
 	end
 
-	return resumedAnything
+	return didAnything
 end
 
 -- ============================================================================
--- MIC WATCHER
--- Polls microphone state and enforces the core rule:
---   mic active  + audio playing → pause audio
---   mic inactive + we paused something → resume audio, stop polling
+-- MIC WATCHER: enforces "mic active = no audio"
 -- ============================================================================
-
 local function startMicWatcher()
 	if micWatcher then micWatcher:stop() end
 
 	log("MIC WATCHER: Started")
-	micWatcher = hs.timer.doEvery(POLL_INTERVAL, function()
+	micWatcher = hs.timer.doEvery(0.5, function()
 		local micOn = micIsActive()
 
-		if micOn then
-			local spotPlaying = spotifyIsPlaying()
-			local chromeTab = findPlayingChromeVideo()
-			if spotPlaying or chromeTab then
-				log("MIC WATCHER: Mic active but audio playing — pausing")
-				pauseAllMedia()
-			end
-		else
-			if spotifyPausedByUs or chromePausedTab then
-				log("MIC WATCHER: Mic inactive — resuming media")
+		if not micOn then
+			-- Mic went inactive: resume what we changed, stop watching
+			if spotifyPausedByUs or systemMutedByUs then
+				log("MIC WATCHER: Mic inactive — resuming")
 				resumeOurMedia()
-				if micWatcher then
-					micWatcher:stop()
-					micWatcher = nil
-					log("MIC WATCHER: Stopped")
-				end
+			end
+			if micWatcher then
+				micWatcher:stop()
+				micWatcher = nil
+				log("MIC WATCHER: Stopped")
 			end
 		end
 	end)
 end
 
 -- ============================================================================
--- HOTKEY TRIGGER
+-- TRIGGER
 -- ============================================================================
-
 local lastToggle = 0
 
 local function onTrigger()
 	local now = hs.timer.secondsSinceEpoch()
-	if now - lastToggle < DEBOUNCE_INTERVAL then
-		log("DEBOUNCED")
-		return
-	end
+	if now - lastToggle < 0.3 then return end
 	lastToggle = now
 
 	log("TRIGGER: mic=" .. tostring(micIsActive()))
@@ -251,11 +173,8 @@ local function onTrigger()
 end
 
 -- ============================================================================
--- KEY DETECTION
--- Listens for Ctrl+Shift modifier combo (flagsChanged event).
--- This fires when the modifier keys are pressed, before any letter key.
+-- CTRL+SHIFT DETECTION
 -- ============================================================================
-
 local ctrlShiftDown = false
 local keyWatcher = hs.eventtap.new({hs.eventtap.event.types.flagsChanged}, function(e)
 	local f = e:getFlags()
@@ -263,10 +182,10 @@ local keyWatcher = hs.eventtap.new({hs.eventtap.event.types.flagsChanged}, funct
 
 	if down and not ctrlShiftDown then
 		ctrlShiftDown = true
+		log("Ctrl+Shift DOWN")
 		local ok, err = pcall(onTrigger)
 		if not ok then
 			log("ERROR: " .. tostring(err))
-			hs.alert.show("Error: " .. tostring(err), 2)
 		end
 	elseif not down and ctrlShiftDown then
 		ctrlShiftDown = false
@@ -276,15 +195,7 @@ local keyWatcher = hs.eventtap.new({hs.eventtap.event.types.flagsChanged}, funct
 end)
 keyWatcher:start()
 
--- ============================================================================
--- RELOAD HOTKEY
--- ============================================================================
-
-hs.hotkey.bind({"cmd", "ctrl"}, "r", function()
-	hs.reload()
-end)
-
--- ============================================================================
+hs.hotkey.bind({"cmd", "ctrl"}, "r", function() hs.reload() end)
 
 log("Wispr Media Controller loaded")
 hs.alert.show("Wispr Media Controller", 1)
